@@ -101,10 +101,10 @@ class DataHandler:
                         x += 1
                         r = random.random()
                         if r >= 0.5:
-                            tmp.append([str(y)+'-'+str(len(lines)), \
+                            tmp.append([str(file)+'-'+str(y)+'-'+str(len(lines)), \
                                                 sent1, sent2, 1, i, j])
                         else:
-                            tmp.append([str(y)+'-'+str(len(lines)), \
+                            tmp.append([str(file)+'-'+str(y)+'-'+str(len(lines)), \
                                                 sent2, sent1, 0, j, i])
 
                 for row in tmp:
@@ -148,10 +148,10 @@ class DataHandler:
                         x += 1
                         r = random.random()
                         if r >= 0.5:
-                            tmp.append([str(y)+'-'+str(len(story)), \
+                            tmp.append([str(story_id)+'-'+str(y)+'-'+str(len(story)), \
                                                 sent1, sent2, 1, i, j])
                         else:
-                            tmp.append([str(y)+'-'+str(len(story)), \
+                            tmp.append([str(story_id)+'-'+str(y)+'-'+str(len(story)), \
                                                 sent2, sent1, 0, j, i])
 
                 for row in tmp:
@@ -201,9 +201,9 @@ class DataHandler:
 
                         x += 1
                         tsv_writer.writerow(
-                            [split+'-'+str(y)+'-'+str(x), sent1, sent2, 1])
+                            [str(file)+':'+str(i)+':'+str(j)+':'+split+'-'+str(y)+'-'+str(x), sent1, sent2, 1])
                         tsv_writer.writerow(
-                            [split+'-'+str(y)+'-'+str(x), sent2, sent1, 0])
+                            [str(file)+':'+str(j)+':'+str(i)+':'+split+'-'+str(y)+'-'+str(x), sent2, sent1, 0])
 
     def get_convert_write_sind(self, split, filename, out_dir):
         data = self.load_json_file(split)
@@ -234,9 +234,9 @@ class DataHandler:
 
                         x += 1
                         tsv_writer.writerow(
-                            [split+'-'+str(y)+'-'+str(x), sent1, sent2, 1])
+                            [str(file)+'-'+split+'-'+str(y)+'-'+str(x), sent1, sent2, 1])
                         tsv_writer.writerow(
-                            [split+'-'+str(y)+'-'+str(x), sent2, sent1, 0])
+                            [str(file)+'-'+split+'-'+str(y)+'-'+str(x), sent2, sent1, 0])
 
         
 def main():

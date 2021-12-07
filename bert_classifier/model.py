@@ -25,6 +25,7 @@ import random
 import csv
 import codecs
 import functools
+import torch.nn as nn
 
 import numpy as np
 import torch
@@ -55,6 +56,23 @@ MODEL_CLASSES = {
     'bert': (BertConfig, BertModel, BertTokenizer)
 }
 
+class AdditiveAttention(nn.Module):
+    
+    def __init__(self, hidden_dim):
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.W = nn.Linear(hidden_dim, hidden_dim) 
+        self.tanh = nn.Tanh()
+        self.v = nn.Parameter(torch.Tensor(1, hidden_dim))
+        self.softmax = nn.Softmax(dim=1)
+        nn.init.normal_(self.v, 0, 0.1)
+     
+    def forward(self, h_i):
+      u_i = self.tanh(self.W(h_i))
+      alpha_i = self.softmax(self.v @ torch.transpose(u_i,0,1))
+      result = alpha_i @ h_i
+      return result
 
 def set_seed(args):
     random.seed(args.seed)
@@ -63,6 +81,49 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
+def getSent1TokenRange(inputData):
+  startEndIdxList = []
+  inputIds = inputData['input_ids']
+  for inputId in inputIds:
+    startIdx = (inputId == 101).nonzero()[0][0]
+    endIdx = (inputId == 102).nonzero()[0][0]
+    startEndIdxList.append((startIdx, endIdx))
+
+  return startEndIdxList
+
+def attendToTokenEmbeddings(args, tokenEmbeddingsAfterBertLayer, sentTokenRange):
+  hidden_dim = 768
+  a = AdditiveAttention(hidden_dim)
+  pairwiseSentenceRepresentation = []
+
+  for i in range(len(tokenEmbeddingsAfterBertLayer)):
+    tokenEmbeddingAfterBertLayer = tokenEmbeddingsAfterBertLayer[i]
+    tokenRange = sentTokenRange[i]
+    sId = tokenRange[0] + 1
+    eId = tokenRange[1]
+    firstSentenceTokenRep = tokenEmbeddingAfterBertLayer[sId : eId]
+    firstSentenceTokenRep.to(args.device)
+    a.to(args.device)
+    sentence_rep = a.forward(firstSentenceTokenRep)
+    pairwiseSentenceRepresentation.append(sentence_rep)
+
+  return pairwiseSentenceRepresentation
+
+def attendToSentencePairs(args, pairwiseSentenceRepresentation):
+    hidden_dim = 768
+    cattention = AdditiveAttention(hidden_dim)
+    all_pairs = []
+
+    if len(pairwiseSentenceRepresentation) > 0:
+        pairSentReprTensor = pairwiseSentenceRepresentation[0]
+
+    for spair in pairwiseSentenceRepresentation[1:]:
+        pairSentReprTensor = torch.cat((pairSentReprTensor, spair), dim=0)
+
+        pairSentReprTensor.to(args.device)
+        cattention.to(args.device)
+        all_pairs.append(cattention.forward(pairSentReprTensor))
+    return all_pairs
 
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
@@ -149,20 +210,26 @@ def train(args, train_dataset, model, tokenizer):
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
                       'attention_mask': batch[1],
-                      'token_type_ids': batch[2],
-                      'padding' : True,
-                      'truncation' : True,
-                      'return_tensors' : "pt"
+                      'token_type_ids': batch[2]
                     }
 
-            outputs = model(**inputs,  output_hidden_states=True)
-            hidden_state = outputs['last_hidden_state'][0]
+            outputs = model(**inputs)
+            hidden_state = outputs[0]
+            print(hidden_state.shape)
+            hidden_state.to(args.device)
             
-            # this goes into the attention layer 
+            sentTokenRange = getSent1TokenRange(inputs)
+            pairwiseSentenceRepresentation = attendToTokenEmbeddings(args, hidden_state, sentTokenRange)
+            allpairsSentenceRepresentation = attendToSentencePairs(args, pairwiseSentenceRepresentation)
+            
+            print(allpairsSentenceRepresentation)
+            # this goes into the paragraph encoder
+
+            # what do we send to the final linear layer?
+
+            # loss is calculated after this
             
             # loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
-
-
 
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu parallel training
@@ -436,20 +503,13 @@ def evaluate(args, model, tokenizer, prefix=""):
 
     return results
 
-# copy of the function
-# def load_and_cache_examples(args, tokenizer, evaluate=False):
-#     if args.local_rank not in [-1, 0] and not evaluate:
-#         torch.distributed.barrier()  
-
-#     processor = PairProcessor()
-
 
 def load_and_cache_examples(args, tokenizer, evaluate=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  
 
     processor = PairProcessor()
-    # output_mode = 'classification'
+    output_mode = 'classification'
     
     cached_features_file = os.path.join(
         args.data_dir, 'cached_{}_{}_{}_{}'.format(
@@ -466,7 +526,16 @@ def load_and_cache_examples(args, tokenizer, evaluate=False):
         logger.info(
             "Creating features from dataset file at %s", args.data_dir)
         label_list = processor.get_labels()
-        examples = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+        examples  = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+        para_id = []
+        s1_id = []
+        s2_id = []
+        for example in examples:
+            ids = example.guid.split(":")
+            para_id.append(ids[0])
+            s1_id.append(ids[1])
+            s2_id.append(ids[2])
+        
         features = convert_examples_to_features(examples,
                                     tokenizer,
                                     label_list=label_list,
