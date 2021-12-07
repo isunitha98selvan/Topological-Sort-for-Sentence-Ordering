@@ -35,7 +35,7 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
 
 from transformers import (WEIGHTS_NAME, BertConfig,
-                    BertForSequenceClassification, BertTokenizer)
+                    BertModel, BertTokenizer)
 
 from transformers import AdamW, get_linear_schedule_with_warmup
 
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 #        BertConfig)), ())
 
 MODEL_CLASSES = {
-    'bert': (BertConfig, BertForSequenceClassification, BertTokenizer)
+    'bert': (BertConfig, BertModel, BertTokenizer)
 }
 
 
@@ -150,11 +150,19 @@ def train(args, train_dataset, model, tokenizer):
             inputs = {'input_ids':      batch[0],
                       'attention_mask': batch[1],
                       'token_type_ids': batch[2],
-                      'labels':         batch[3]
+                      'padding' : True,
+                      'truncation' : True,
+                      'return_tensors' : "pt"
                     }
 
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+            outputs = model(**inputs,  output_hidden_states=True)
+            hidden_state = outputs['last_hidden_state'][0]
+            
+            # this goes into the attention layer 
+            
+            # loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+
+
 
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu parallel training
@@ -428,13 +436,20 @@ def evaluate(args, model, tokenizer, prefix=""):
 
     return results
 
+# copy of the function
+# def load_and_cache_examples(args, tokenizer, evaluate=False):
+#     if args.local_rank not in [-1, 0] and not evaluate:
+#         torch.distributed.barrier()  
+
+#     processor = PairProcessor()
+
 
 def load_and_cache_examples(args, tokenizer, evaluate=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  
 
     processor = PairProcessor()
-    output_mode = 'classification'
+    # output_mode = 'classification'
     
     cached_features_file = os.path.join(
         args.data_dir, 'cached_{}_{}_{}_{}'.format(
