@@ -89,9 +89,7 @@ class AdditiveAttention(nn.Module):
       return result
 
 hidden_dim = 768
-cattention = AdditiveAttention(hidden_dim).cuda()
-a = AdditiveAttention(hidden_dim).cuda()
-lc = LinearClassifier(hidden_dim).cuda()
+
 
 
 class EncoderBlock(nn.Module):
@@ -146,7 +144,7 @@ def getSent1TokenRange(inputId):
     startEndIdxList.append((startIdxs2, endIdxs2))
     return startEndIdxList
 
-def attendToTokenEmbeddings(args, tokenEmbeddingAfterBertLayer, sentTokenRange):
+def attendToTokenEmbeddings(args, a, tokenEmbeddingAfterBertLayer, sentTokenRange):
     sentenceRepresentation = []
     a.to(args.device)
     tokenRanges1 = sentTokenRange[0]
@@ -171,12 +169,13 @@ def attendToTokenEmbeddings(args, tokenEmbeddingAfterBertLayer, sentTokenRange):
     return sentenceRepresentation
 
 
-def attendToSentencePairs(args, pairwiseSentenceRepresentation):
+def attendToSentencePairs(args, cattention, pairwiseSentenceRepresentation):
     hidden_dim = 768
 
     if len(pairwiseSentenceRepresentation) > 0:
         pairwiseSentenceRepresentation[0] = pairwiseSentenceRepresentation[0].reshape(1,-1)
-        pairSentReprTensor = pairwiseSentenceRepresentation[0].cuda()
+        pairSentReprTensor = pairwiseSentenceRepresentation[0]
+        # pairSentReprTensor = pairwiseSentenceRepresentation[0].to(device=args.device)
         # pairwiseSentenceRepresentation[0].to(args.device)
         
     for i,spair in enumerate(pairwiseSentenceRepresentation):
@@ -194,11 +193,16 @@ def attendToSentencePairs(args, pairwiseSentenceRepresentation):
 
 def train(args, model, tokenizer):
     """ Train the model """
+    cattention = AdditiveAttention(hidden_dim).to(device=args.device)
+    a = AdditiveAttention(hidden_dim).to(device=args.device)
+    lc = LinearClassifier(hidden_dim).to(device=args.device)
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
     
     processor = PairProcessor()
     output_mode = 'classification'
+
+   
 
     label_list = processor.get_labels()
     # examples  = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
@@ -234,7 +238,7 @@ def train(args, model, tokenizer):
 
     set_seed(args)
     
-    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).cuda()
+    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).to(device=args.device)
     loss = nn.BCELoss()
     acc_loss = 0.0
     global_step = 0
@@ -276,9 +280,10 @@ def train(args, model, tokenizer):
 
                 start_idx = i
                 train_dataloader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+                
                 if args.max_steps > 0:
                     t_total = args.max_steps
-                    args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+                    # args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
                 else:
                     t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
                 
@@ -297,47 +302,49 @@ def train(args, model, tokenizer):
                 logger.info("  Total optimization steps = %d", t_total)
 
                 n_sent = max(all_s2) + 1
-                pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).cuda()
-                pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).cuda()
+                pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
+                pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
 
-                train_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-                for step, batch in enumerate(train_iterator):
-                    model.train()
-                    batch_1 = tuple(t.to(args.device) for t in batch)
+                # train_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+                # for step, batch in enumerate(train_iterator):
+                gen = iter(train_dataloader)
+                batch = next(gen)
+                model.train()
+                batch_1 = tuple(t.to(args.device) for t in batch)
 
-                    inputs = {'input_ids':      batch_1[0],
-                            'attention_mask': batch_1[1],
-                            'token_type_ids': batch_1[2]
-                            }
-                    labels = (batch_1[3]).to(torch.float32)
-                    s1 = batch_1[4]
-                    s2 = batch_1[5]
-                    outputs = model(**inputs)
-                    hidden_state = outputs[0]
-                    model.to(args.device)
-                    hidden_state.to(args.device)
-                    for i in range(hidden_state.shape[0]):
-                        sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
-                        res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
-                        pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
-                        pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
-                
-                    allpairsSentenceRepresentation = torch.zeros(n_sent, 768).cuda()
-              
-                    for sent in range(n_sent):
-                        #get all 2n - 2 representations
-                        allReps = []
-                        for ri in range(n_sent):
-                            for ci in range(n_sent):
-                                if ri == sent or ci == sent:
-                                    if pairwiseSentenceRepresentation_1[ri][ci] is not None:
-                                        allReps.append(pairwiseSentenceRepresentation_1[ri][ci])
-                                    if pairwiseSentenceRepresentation_2[ri][ci] is not None:
-                                        allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
-                    
-
-                    allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
+                inputs = {'input_ids':      batch_1[0],
+                        'attention_mask': batch_1[1],
+                        'token_type_ids': batch_1[2]
+                        }
+                labels = (batch_1[3]).to(torch.float32)
+                s1 = batch_1[4]
+                s2 = batch_1[5]
+                outputs = model(**inputs)
+                hidden_state = outputs[0]
+                # model.to(args.device)
+                # hidden_state.to(args.device)
+                for i in range(hidden_state.shape[0]):
+                    sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
+                    res = attendToTokenEmbeddings(args, a, hidden_state[i], sentTokenRange)
+                    pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
+                    pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
             
+                allpairsSentenceRepresentation = torch.zeros(n_sent, 768).to(device=args.device)
+            
+                for sent in range(n_sent):
+                    #get all 2n - 2 representations
+                    allReps = []
+                    for ri in range(n_sent):
+                        for ci in range(n_sent):
+                            if ri == sent or ci == sent:
+                                if pairwiseSentenceRepresentation_1[ri][ci] is not None:
+                                    allReps.append(pairwiseSentenceRepresentation_1[ri][ci])
+                                if pairwiseSentenceRepresentation_2[ri][ci] is not None:
+                                    allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
+                
+
+                allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, cattention, allReps)
+        
                 allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
                 op = paragraphEncoder(allpairsSentenceRepresentation)
 
@@ -350,36 +357,32 @@ def train(args, model, tokenizer):
                     output = lc(x)
                     output[0].to(args.device)
                     tr_loss=loss(output[0].reshape(1,-1), label.reshape(1,-1))
+                    if args.gradient_accumulation_steps > 1:
+                        tr_loss = tr_loss / args.gradient_accumulation_steps
                     print("Loss", tr_loss)
-                    model.zero_grad()
                     tr_loss.backward(retain_graph=True)
-                    optimizer.step()
-                    scheduler.step()
-                    global_step += 1
+                    if (i + 1) % args.gradient_accumulation_steps == 0:
+                        optimizer.step()
+                        scheduler.step()
+                        global_step += 1
+                        model.zero_grad()
                     acc_loss+=tr_loss
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 
                 s1_id = []
                 s2_id = []
+                del pairwiseSentenceRepresentation_1
+                del pairwiseSentenceRepresentation_2
+                del allpairsSentenceRepresentation
+                del batch_1
+                torch.cuda.empty_cache()
+
+
             para_id = ids[0]
             s1_id.append(ids[1])
             s2_id.append(ids[2])
-
-        # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-        # Log metrics
-        # if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-        results = evaluate(args, model, tokenizer)
         
-        # for key, value in results.items():
-        #     tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-        tb_writer.add_scalar('loss', results)
-        # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
-        # print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
-        # logging_loss = tr_loss
-
-        # if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-            # Save model checkpoint
         output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -387,6 +390,22 @@ def train(args, model, tokenizer):
         model_to_save.save_pretrained(output_dir)
         torch.save(args, os.path.join(output_dir, 'training_args.bin'))
         logger.info("Saving model checkpoint to %s", output_dir)
+
+        # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+        # Log metrics
+        # if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+    results = evaluate(args, model, tokenizer)
+    
+    # for key, value in results.items():
+    #     tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+    tb_writer.add_scalar('loss', results)
+        # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+        # print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
+        # logging_loss = tr_loss
+
+        # if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+            # Save model checkpoint
+    
 
     if args.local_rank in [-1, 0]:
         tb_writer.close()
@@ -556,7 +575,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     eval_outputs_dirs = (args.output_dir)
 
     results = {}
-    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).cuda()
+    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).to(device=args.device)
     for eval_output_dir in eval_outputs_dirs:
         # eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
 
@@ -638,8 +657,8 @@ def evaluate(args, model, tokenizer, prefix=""):
                         s1 = batch[4]
                         s2 = batch[5]
                         
-                        pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).cuda()
-                        pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).cuda()
+                        pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
+                        pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
 
                         for i in range(hidden_state.shape[0]):
                             sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
@@ -647,7 +666,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                             pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
                             pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
                     
-                    allpairsSentenceRepresentation = torch.zeros(n_sent, 768).cuda()
+                    allpairsSentenceRepresentation = torch.zeros(n_sent, 768).to(device=args.device)
               
                     for sent in range(n_sent):
                         #get all 2n - 2 representations
@@ -674,15 +693,18 @@ def evaluate(args, model, tokenizer, prefix=""):
                         output[0].to(args.device)
                         tr_loss+=loss(output[0].reshape(1,-1), label.reshape(1,-1))
                         # preds.append(output[0].item())
+                        res = 0.0
                         if output[0]>0.5:
-                            preds.append(1.0)
+                            res = 1.0  
                         else:
-                            preds.append(0.0)
+                            res = 0.0
+                        preds.append(res)
 
                         out_label_ids.append(label.item())
                         global_step += 1
                         
-                        f.write(str(para_id) + " " + str(sent1_id) + " " + str(sent2_id) + " " + str(output[0]) + " " + str(label))
+                        f.write(str(para_id) + " " + str(sent1_id.item()) + " " + str(sent2_id.item()) + " " + str(res) + " " + str(label.item()))
+                        f.write("\n")
                 s1_id = []
                 s2_id = []
             para_id = ids[0]
@@ -951,14 +973,14 @@ def main():
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
             model = model_class.from_pretrained(checkpoint)
             model.to(args.device)
-            if args.do_test:
-                result = evaluate_test(args, model, tokenizer, prefix=global_step)
-            elif args.do_eval:
-                result = evaluate(args, model, tokenizer, prefix=global_step)
-            result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
-            results.update(result)
+            # if args.do_test:
+                # result = evaluate_test(args, model, tokenizer, prefix=global_step)
+            # elif args.do_eval:
+                # result = evaluate(args, model, tokenizer, prefix=global_step)
+            # result = dict((k + '_{}'.format(global_step), v) for k, v in result.items())
+            # results.update(result)
 
-    return results
+    return None
 
 if __name__ == "__main__":
     main()
