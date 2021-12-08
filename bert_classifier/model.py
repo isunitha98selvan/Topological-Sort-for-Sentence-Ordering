@@ -218,15 +218,6 @@ def train(args, model, tokenizer):
         eps=args.adam_epsilon
         )
 
-    # if args.fp16:
-    #     try:
-    #         from apex import amp
-    #     except ImportError:
-    #         raise ImportError("Please install apex from "
-    #         "https://www.github.com/nvidia/apex to use fp16 training.")
-    #     model, optimizer = amp.initialize(
-    #         model, optimizer, opt_level=args.fp16_opt_level)
-
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
@@ -247,161 +238,153 @@ def train(args, model, tokenizer):
     s2_id = []
     paragraphEncoder = ParagraphEncoder(12, 768, 6, 32)
     loss = nn.BCELoss()
-    for i,example in enumerate(examples):
-        ids = example.guid.split(":")
-        print("ids: ", ids)
-        if i!=0 and ids[0]!=para_id:
-            features = convert_examples_to_features(examples[start_idx:i],
-                                tokenizer,
-                                label_list=label_list[start_idx:i],
-                                max_length=args.max_seq_length,
-                                output_mode=output_mode,
-                                pad_on_left=False,                 # pad on the left for xlnet
-                                pad_token=tokenizer.convert_tokens_to_ids(
-                                    [tokenizer.pad_token])[0],
-                                pad_token_segment_id=0,
-                                )
+    for epoch in range(3):
+        for i,example in enumerate(examples):
+            ids = example.guid.split(":")
+            if i!=0 and ids[0]!=para_id:
+                features = convert_examples_to_features(examples[start_idx:i],
+                                    tokenizer,
+                                    label_list=label_list[start_idx:i],
+                                    max_length=args.max_seq_length,
+                                    output_mode=output_mode,
+                                    pad_on_left=False,                 # pad on the left for xlnet
+                                    pad_token=tokenizer.convert_tokens_to_ids(
+                                        [tokenizer.pad_token])[0],
+                                    pad_token_segment_id=0,
+                                    )
 
-            all_input_ids = torch.tensor(
-                [f.input_ids for f in features], dtype=torch.long)
-            all_attention_mask = torch.tensor(
-                [f.attention_mask for f in features], dtype=torch.long)
-            all_token_type_ids = torch.tensor(
-                [f.token_type_ids for f in features], dtype=torch.long)
-            all_labels = torch.tensor(
-                [f.label for f in features], dtype=torch.long)
-            print("s1 id: ", s1_id)
-            all_s1 = torch.tensor([int(s) for s in s1_id], dtype=torch.int32)
-            all_s2 = torch.tensor([int(s) for s in s2_id], dtype=torch.int32)
-    
-            dataset = TensorDataset(
-                all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_s1, all_s2)
+                all_input_ids = torch.tensor(
+                    [f.input_ids for f in features], dtype=torch.long)
+                all_attention_mask = torch.tensor(
+                    [f.attention_mask for f in features], dtype=torch.long)
+                all_token_type_ids = torch.tensor(
+                    [f.token_type_ids for f in features], dtype=torch.long)
+                all_labels = torch.tensor(
+                    [f.label for f in features], dtype=torch.long)
+                all_s1 = torch.tensor([int(s) for s in s1_id], dtype=torch.int32)
+                all_s2 = torch.tensor([int(s) for s in s2_id], dtype=torch.int32)
+        
+                dataset = TensorDataset(
+                    all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_s1, all_s2)
 
-            start_idx = i
-            train_dataloader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
-            if args.max_steps > 0:
-                t_total = args.max_steps
-                args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
-            else:
-                t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
-            
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer, 
-                num_warmup_steps=args.warmup_steps, 
-                num_training_steps=t_total
-                )
-            logger.info("***** Running training *****")
-            logger.info("  Num examples = %d", len(dataset))
-            logger.info("  Num Epochs = %d", args.num_train_epochs)
-            # logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
-            # logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-            #             args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-            # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-            logger.info("  Total optimization steps = %d", t_total)
-
-            global_step = 0
-            tr_loss, logging_loss = 0.0, 0.0
-            model.zero_grad()
-            train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
-            for _ in train_iterator:
-                n_sent = max(all_s2)
-                pairwiseSentenceRepresentation_1 = torch.zeros(n_sent + 1, n_sent + 1, 768)
-                pairwiseSentenceRepresentation_2 = torch.zeros(n_sent + 1, n_sent + 1, 768)
-
-                epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-                firstSentId = 1
-                for step, batch in enumerate(epoch_iterator):
-                    model.train()
-                    batch_1 = tuple(t.to(args.device) for t in batch)
-                    inputs = {'input_ids':      batch_1[0],
-                            'attention_mask': batch_1[1],
-                            'token_type_ids': batch_1[2]
-                            }
-                    labels = (batch_1[3]).to(torch.float32)
-                    s1 = batch_1[4]
-                    s2 = batch_1[5]
-                    outputs = model(**inputs)
-                    hidden_state = outputs[0]
-                    hidden_state.to(args.device)
-                    
-                    for i in range(hidden_state.shape[0]):
-                        sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
-                        res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
-                        pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
-                        pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
+                start_idx = i
+                train_dataloader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+                if args.max_steps > 0:
+                    t_total = args.max_steps
+                    args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+                else:
+                    t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
                 
-                allpairsSentenceRepresentation = torch.zeros(n_sent, 768)
-                for sent in range(n_sent):
-                    #get all 2n - 2 representations
-                    allReps = []
-                    for ri in range(n_sent):
-                        for ci in range(n_sent):
-                            if ri == sent or ci == sent:
-                                if pairwiseSentenceRepresentation_1[ri][ci] is not None:
-                                    allReps.append(pairwiseSentenceRepresentation_1[ri][ci])
-                                if pairwiseSentenceRepresentation_2[ri][ci] is not None:
-                                    allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer, 
+                    num_warmup_steps=args.warmup_steps, 
+                    num_training_steps=t_total
+                    )
+                logger.info("***** Running training *****")
+                logger.info("  Num examples = %d", len(dataset))
+                logger.info("  Num Epochs = %d", args.num_train_epochs)
+                # logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+                # logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                #             args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
+                # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+                logger.info("  Total optimization steps = %d", t_total)
+
+                global_step = 0
+                tr_loss, logging_loss = 0.0, 0.0
+                train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
+                for _ in train_iterator:
+                    n_sent = max(all_s2) + 1
+                    pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768)
+                    pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768)
+
+                    epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+                    firstSentId = 1
+                    for step, batch in enumerate(epoch_iterator):
+                        model.train()
+                        batch_1 = tuple(t.to(args.device) for t in batch)
+                        inputs = {'input_ids':      batch_1[0],
+                                'attention_mask': batch_1[1],
+                                'token_type_ids': batch_1[2]
+                                }
+                        labels = (batch_1[3]).to(torch.float32)
+                        s1 = batch_1[4]
+                        s2 = batch_1[5]
+                        outputs = model(**inputs)
+                        hidden_state = outputs[0]
+                        hidden_state.to(args.device)
+                        for i in range(hidden_state.shape[0]):
+                            sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
+                            res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
+                            pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
+                            pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
                     
-                    allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
-                print("No of sentences: ", n_sent)
-                print("Sentence ids: ", s1)
-                print("Shape :", allpairsSentenceRepresentation.shape)
-            
-                allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
-                op = paragraphEncoder(allpairsSentenceRepresentation)
-                print("op.shape: ", op.shape)
+                    allpairsSentenceRepresentation = torch.zeros(n_sent, 768)
+                    allpairsSentenceRepresentation.to(args.device)
+                    for sent in range(n_sent):
+                        #get all 2n - 2 representations
+                        allReps = []
+                        for ri in range(n_sent):
+                            for ci in range(n_sent):
+                                if ri == sent or ci == sent:
+                                    if pairwiseSentenceRepresentation_1[ri][ci] is not None:
+                                        allReps.append(pairwiseSentenceRepresentation_1[ri][ci])
+                                    if pairwiseSentenceRepresentation_2[ri][ci] is not None:
+                                        allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
+                        
+                        allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
+                
+                    allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
+                    op = paragraphEncoder(allpairsSentenceRepresentation)
 
-                for i in range(len(s1)):
-                    sent1_id, sent2_id = s1[i], s2[i]
-                    label = labels[i]
-            
-                    # print("OP: ", op[0][sent1_id].shape)
-                    x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
-                    output = lc(x)
-                    output[0].to(args.device)
-                    print("label : ", label.is_cuda)
-                    print("o/p: ",output.is_cuda)
-                    print("output: ",output[0])
-                    print("label: ",label)
-                    
-                    loss(output[0].reshape(1,-1), label.reshape(1,-1))
-                    loss.backward()
+                    for i in range(len(s1)):
+                        sent1_id, sent2_id = s1[i], s2[i]
+                        label = labels[i]
+                
+                        # print("OP: ", op[0][sent1_id].shape)
+                        x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
+                        output = lc(x)
+                        output[0].to(args.device)
+                        # print("label : ", label.is_cuda)
+                        # print("o/p: ",output.is_cuda)
+                        # print("output: ",output[0])
+                        # print("label: ",label)
+                        
+                        tr_loss=loss(output[0].reshape(1,-1), label.reshape(1,-1))
+                        print("Loss", tr_loss)
+                        model.zero_grad()
+                        tr_loss.backward(retain_graph=True)
+                        optimizer.step()
+                        scheduler.step()
+                        global_step += 1
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                
+                s1_id = []
+                s2_id = []
+            para_id = ids[0]
+            s1_id.append(ids[1])
+            s2_id.append(ids[2])
 
-                tr_loss += loss.item()
-                if (step + 1) % args.gradient_accumulation_steps == 0:
-                    optimizer.step()
-                    scheduler.step()  # Update learning rate schedule
-                    model.zero_grad()
-                    global_step += 1
-            
-            s1_id = []
-            s2_id = []
-        para_id = ids[0]
-        s1_id.append(ids[1])
-        s2_id.append(ids[2])
+        if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+            # Log metrics
+            if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+                results = evaluate(args, model, tokenizer)
+                for key, value in results.items():
+                    tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+            tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+            tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+            print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
+            logging_loss = tr_loss
 
-    if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-        # Log metrics
-        if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-            results = evaluate(args, model, tokenizer)
-            for key, value in results.items():
-                tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-        tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-        tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
-        print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
-        logging_loss = tr_loss
-
-    if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-        # Save model checkpoint
-        output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
-        model_to_save.save_pretrained(output_dir)
-        torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-        logger.info("Saving model checkpoint to %s", output_dir)
+        if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+            # Save model checkpoint
+            output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+            model_to_save.save_pretrained(output_dir)
+            torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+            logger.info("Saving model checkpoint to %s", output_dir)
 
     if args.local_rank in [-1, 0]:
         tb_writer.close()
