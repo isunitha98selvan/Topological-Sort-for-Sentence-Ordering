@@ -25,6 +25,8 @@ import random
 import csv
 import codecs
 import functools
+
+from numpy.lib.function_base import gradient
 import torch.nn as nn
 from collections import defaultdict
 
@@ -35,6 +37,7 @@ from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
 from torch.utils.data.distributed import DistributedSampler
 from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
+from torch.cuda.amp import GradScaler, autocast
 
 from transformers import (WEIGHTS_NAME, BertConfig,
                     BertModel, BertTokenizer)
@@ -101,19 +104,19 @@ class EncoderBlock(nn.Module):
     self.layer_norm = nn.LayerNorm(hidden_dim)
     # Two-layer MLP
     dropout=0.0
-    self.ffn = nn.Sequential(
-        nn.Linear(hidden_dim, dim_feedforward),
-        nn.Dropout(dropout),
-        nn.ReLU(inplace=True),
-        nn.Linear(dim_feedforward, hidden_dim)
-    )
+
+    self.linear1 = nn.Linear(hidden_dim, dim_feedforward)
+    self.dropout = nn.Dropout(dropout)
+    self.relu = nn.ReLU(inplace=True)
+    self.linear2 = nn.Linear(dim_feedforward, hidden_dim)
+
     self.multihead_attn = nn.MultiheadAttention(hidden_dim, num_heads)
 
 
   def forward(self, X):
     attn_output, attn_output_weights = self.multihead_attn(X, X, X)
     X_capL = self.layer_norm(X + attn_output)
-    X_L = self.layer_norm(X_capL + self.ffn(X_capL))
+    X_L = self.layer_norm(X_capL + self.linear2(self.relu(self.dropout(self.linear1(X_capL)))))
 
     return X_L
 
@@ -146,7 +149,6 @@ def getSent1TokenRange(inputId):
 
 def attendToTokenEmbeddings(args, a, tokenEmbeddingAfterBertLayer, sentTokenRange):
     sentenceRepresentation = []
-    a.to(args.device)
     tokenRanges1 = sentTokenRange[0]
     tokenRanges2 = sentTokenRange[1]
     s1Id = tokenRanges1[0]
@@ -196,6 +198,7 @@ def train(args, model, tokenizer):
     cattention = AdditiveAttention(hidden_dim).to(device=args.device)
     a = AdditiveAttention(hidden_dim).to(device=args.device)
     lc = LinearClassifier(hidden_dim).to(device=args.device)
+    scaler = GradScaler()
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
     
@@ -242,15 +245,15 @@ def train(args, model, tokenizer):
     loss = nn.BCELoss()
     acc_loss = 0.0
     global_step = 0
-    for epoch in range(1):
+    for epoch in range(3):
         tr_loss = 0.0
-        print("Starting epoch: ", epoch)
         para_id = 0
         start_idx = 0
         s1_id = []
         s2_id = []
         for i,example in enumerate(examples):
             # print("Batch: ", i)
+
             ids = example.guid.split(":")
             if i!=0 and ids[0]!=para_id:
                 features = convert_examples_to_features(examples[start_idx:i],
@@ -301,7 +304,13 @@ def train(args, model, tokenizer):
                 # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
                 logger.info("  Total optimization steps = %d", t_total)
 
-                n_sent = max(all_s2) + 1
+                n_sent = max(max(all_s1) , max(all_s2)) + 1
+                if n_sent>10:
+                    s1_id=[]
+                    s2_id=[]
+                    s1_id.append(ids[1])
+                    s2_id.append(ids[2])
+                    continue
                 pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
                 pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
 
@@ -316,7 +325,7 @@ def train(args, model, tokenizer):
                         'attention_mask': batch_1[1],
                         'token_type_ids': batch_1[2]
                         }
-                labels = (batch_1[3]).to(torch.float32)
+                labels = (batch_1[3]).to(torch.int)
                 s1 = batch_1[4]
                 s2 = batch_1[5]
                 outputs = model(**inputs)
@@ -348,25 +357,34 @@ def train(args, model, tokenizer):
                 allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
                 op = paragraphEncoder(allpairsSentenceRepresentation)
 
-
+                alllabel= torch.empty(len(labels))
+                allpreds = torch.empty(len(labels))
                 for i in range(len(s1)):
                     sent1_id, sent2_id = s1[i], s2[i]
                     label = labels[i]
             
                     x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
-                    output = lc(x)
-                    output[0].to(args.device)
-                    tr_loss=loss(output[0].reshape(1,-1), label.reshape(1,-1))
-                    if args.gradient_accumulation_steps > 1:
-                        tr_loss = tr_loss / args.gradient_accumulation_steps
-                    print("Loss", tr_loss)
-                    tr_loss.backward(retain_graph=True)
-                    if (i + 1) % args.gradient_accumulation_steps == 0:
-                        optimizer.step()
-                        scheduler.step()
-                        global_step += 1
-                        model.zero_grad()
-                    acc_loss+=tr_loss
+                    with autocast():
+                        output = lc(x)
+                        allpreds[i] = output[0]
+                        alllabel[i] = label
+
+                # tr_loss=loss(output[0].reshape(1,-1), label.reshape(1,-1))
+                with autocast():
+                    tr_loss = loss(allpreds, alllabel)
+                if args.gradient_accumulation_steps > 1:
+                    tr_loss = tr_loss / args.gradient_accumulation_steps
+                print("Loss", tr_loss)
+                tr_loss.backward(retain_graph=False)
+
+                if (i + 1) % args.gradient_accumulation_steps == 0:
+                    # scaler.step(optimizer)
+                    optimizer.step()
+                    scheduler.step()
+                    # scaler.update()
+                    global_step += 1
+                    model.zero_grad()
+                acc_loss+=tr_loss
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 
@@ -376,6 +394,9 @@ def train(args, model, tokenizer):
                 del pairwiseSentenceRepresentation_2
                 del allpairsSentenceRepresentation
                 del batch_1
+                del alllabel
+                del allpreds
+                del tr_loss
                 torch.cuda.empty_cache()
 
 
@@ -394,7 +415,7 @@ def train(args, model, tokenizer):
         # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
         # Log metrics
         # if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-    results = evaluate(args, model, tokenizer)
+    results = evaluate(args, model, tokenizer, a , cattention, lc)
     
     # for key, value in results.items():
     #     tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
@@ -569,7 +590,7 @@ def evaluate_test(args, model, tokenizer, prefix=""):
 
     return results
 
-def evaluate(args, model, tokenizer, prefix=""):
+def evaluate(args, model, tokenizer, a, cattention, lc, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     
     eval_outputs_dirs = (args.output_dir)
@@ -604,10 +625,8 @@ def evaluate(args, model, tokenizer, prefix=""):
         all_labels = []
         out_label_ids = []
         for i, example in enumerate(examples[0]):
-            # print("Inner: ")
-            # break
             ids = example.guid.split(":")
-            if i!=0 and ids[0]!=para_id:
+            if (i!=0 and ids[0]!=para_id) or i==len(examples[0])-1:
                 features = convert_examples_to_features(examples[0][start_idx:i],
                                     tokenizer,
                                     label_list=label_list,
@@ -659,15 +678,14 @@ def evaluate(args, model, tokenizer, prefix=""):
                         
                         pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
                         pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).to(device=args.device)
-
                         for i in range(hidden_state.shape[0]):
                             sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
-                            res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
+                            res = attendToTokenEmbeddings(args, a, hidden_state[i], sentTokenRange)
                             pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
                             pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
                     
                     allpairsSentenceRepresentation = torch.zeros(n_sent, 768).to(device=args.device)
-              
+                    # allpairsSentenceRepresentation = torch.zeros(n_sent, 768)
                     for sent in range(n_sent):
                         #get all 2n - 2 representations
                         allReps = []
@@ -680,7 +698,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                                         allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
                     
 
-                    allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
+                    allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, cattention, allReps)
             
                     allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
                     op = paragraphEncoder(allpairsSentenceRepresentation)
@@ -690,7 +708,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                 
                         x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
                         output = lc(x)
-                        output[0].to(args.device)
+                        # output[0].to(args.device)
                         tr_loss+=loss(output[0].reshape(1,-1), label.reshape(1,-1))
                         # preds.append(output[0].item())
                         res = 0.0
@@ -703,10 +721,15 @@ def evaluate(args, model, tokenizer, prefix=""):
                         out_label_ids.append(label.item())
                         global_step += 1
                         
-                        f.write(str(para_id) + " " + str(sent1_id.item()) + " " + str(sent2_id.item()) + " " + str(res) + " " + str(label.item()))
+                        f.write(str(para_id) + " " + str(sent1_id.item()) + " " + str(sent2_id.item()) + " " + str(res) + " " + str(label.item()) + " "+str(output[0].item()))
                         f.write("\n")
+                        
                 s1_id = []
                 s2_id = []
+                del allpairsSentenceRepresentation
+                del pairwiseSentenceRepresentation_1
+                del pairwiseSentenceRepresentation_2
+                
             para_id = ids[0]
             s1_id.append(ids[1])
             s2_id.append(ids[2])
@@ -837,7 +860,7 @@ def main():
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--per_gpu_eval_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=16,
                         help="Number of updates steps to accumulate "
                         "before performing a backward/update pass.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
