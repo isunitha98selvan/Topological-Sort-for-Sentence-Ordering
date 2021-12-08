@@ -26,6 +26,7 @@ import csv
 import codecs
 import functools
 import torch.nn as nn
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -45,7 +46,9 @@ from transformers import glue_output_modes as output_modes
 from transformers import glue_processors as processors
 from transformers import glue_convert_examples_to_features as convert_examples_to_features
 from transformers import DataProcessor, InputExample, InputFeatures
+torch.set_printoptions(threshold=1000)
 
+torch.cuda.set_device(0)
 logger = logging.getLogger(__name__)
 
 #ALL_MODELS = sum((tuple(
@@ -55,6 +58,17 @@ logger = logging.getLogger(__name__)
 MODEL_CLASSES = {
     'bert': (BertConfig, BertModel, BertTokenizer)
 }
+
+class LinearClassifier(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        
+        self.fcc = nn.Linear(hidden_dim*2, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, inp):
+        l1 = self.fcc(inp)
+        return self.sigmoid(l1)
 
 class AdditiveAttention(nn.Module):
     
@@ -70,10 +84,50 @@ class AdditiveAttention(nn.Module):
      
     def forward(self, h_i):
       u_i = self.tanh(self.W(h_i))
-      alpha_i = self.softmax(self.v @ torch.transpose(u_i,0,1))
+      alpha_i = self.softmax(self.v @ u_i.T)
       result = alpha_i @ h_i
       return result
 
+hidden_dim = 768
+cattention = AdditiveAttention(hidden_dim)
+a = AdditiveAttention(hidden_dim)
+lc = LinearClassifier(hidden_dim)
+
+class EncoderBlock(nn.Module):
+  def __init__(self, hidden_dim, num_heads, dim_feedforward):
+    super().__init__()
+    
+    self.hidden_dim = hidden_dim
+    self.num_heads = num_heads
+    self.layer_norm = nn.LayerNorm(hidden_dim)
+    # Two-layer MLP
+    dropout=0.0
+    self.ffn = nn.Sequential(
+        nn.Linear(hidden_dim, dim_feedforward),
+        nn.Dropout(dropout),
+        nn.ReLU(inplace=True),
+        nn.Linear(dim_feedforward, hidden_dim)
+    )
+    self.multihead_attn = nn.MultiheadAttention(hidden_dim, num_heads)
+
+
+  def forward(self, X):
+    attn_output, attn_output_weights = self.multihead_attn(X, X, X)
+    X_capL = self.layer_norm(X + attn_output)
+    X_L = self.layer_norm(X_capL + self.ffn(X_capL))
+
+    return X_L
+
+class ParagraphEncoder(nn.Module):
+  def __init__(self, num_layers, hidden_dim, num_heads, dim_feedforward):
+      super().__init__()
+      self.layers = nn.ModuleList([EncoderBlock(hidden_dim, num_heads, dim_feedforward) for _ in range(num_layers)])
+
+  def forward(self, x):
+      for l in self.layers:
+          x = l(x)
+      return x
+    
 def set_seed(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -81,70 +135,74 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
-def getSent1TokenRange(inputData):
-  startEndIdxList = []
-  inputIds = inputData['input_ids']
-  for inputId in inputIds:
-    startIdx = (inputId == 101).nonzero()[0][0]
-    endIdx = (inputId == 102).nonzero()[0][0]
-    startEndIdxList.append((startIdx, endIdx))
+def getSent1TokenRange(inputId):
+    startEndIdxList = []
+    startIdxs1 = (inputId == 101).nonzero()[0] + 1
+    endIdxs1 = (inputId == 102).nonzero()[0]
+    startIdxs2 = (inputId == 102).nonzero()[0] + 1
+    endIdxs2 = (inputId == 102).nonzero()[1]
+    startEndIdxList.append((startIdxs1, endIdxs1))
+    startEndIdxList.append((startIdxs2, endIdxs2))
+    return startEndIdxList
 
-  return startEndIdxList
+def attendToTokenEmbeddings(args, tokenEmbeddingAfterBertLayer, sentTokenRange):
+    sentenceRepresentation = []
 
-def attendToTokenEmbeddings(args, tokenEmbeddingsAfterBertLayer, sentTokenRange):
-  hidden_dim = 768
-  a = AdditiveAttention(hidden_dim)
-  pairwiseSentenceRepresentation = []
+    tokenRanges1 = sentTokenRange[0]
+    tokenRanges2 = sentTokenRange[1]
+    s1Id = tokenRanges1[0]
+    e1Id = tokenRanges1[1]
+    s2Id = tokenRanges2[0]
+    e2Id = tokenRanges2[1]
 
-  for i in range(len(tokenEmbeddingsAfterBertLayer)):
-    tokenEmbeddingAfterBertLayer = tokenEmbeddingsAfterBertLayer[i]
-    tokenRange = sentTokenRange[i]
-    sId = tokenRange[0] + 1
-    eId = tokenRange[1]
-    firstSentenceTokenRep = tokenEmbeddingAfterBertLayer[sId : eId]
+    firstSentenceTokenRep = tokenEmbeddingAfterBertLayer[s1Id : e1Id]
     firstSentenceTokenRep.to(args.device)
     a.to(args.device)
-    sentence_rep = a.forward(firstSentenceTokenRep)
-    pairwiseSentenceRepresentation.append(sentence_rep)
+    sentence_rep_s1 = a.forward(firstSentenceTokenRep)
+    sentenceRepresentation.append(sentence_rep_s1)
 
-  return pairwiseSentenceRepresentation
+    secondSentenceTokenRep = tokenEmbeddingAfterBertLayer[s2Id : e2Id]
+    secondSentenceTokenRep.to(args.device)
+    a.to(args.device)
+    sentence_rep_s2 = a.forward(secondSentenceTokenRep)
+    sentenceRepresentation.append(sentence_rep_s2)
+
+    return sentenceRepresentation
+
 
 def attendToSentencePairs(args, pairwiseSentenceRepresentation):
     hidden_dim = 768
-    cattention = AdditiveAttention(hidden_dim)
-    all_pairs = []
 
     if len(pairwiseSentenceRepresentation) > 0:
+        pairwiseSentenceRepresentation[0] = pairwiseSentenceRepresentation[0].reshape(1,-1)
         pairSentReprTensor = pairwiseSentenceRepresentation[0]
-
-    for spair in pairwiseSentenceRepresentation[1:]:
+        # pairwiseSentenceRepresentation[0].to(args.device)
+        
+    for i,spair in enumerate(pairwiseSentenceRepresentation):
+        spair = spair.reshape(1,-1)
+        # spair.to(args.device)
         pairSentReprTensor = torch.cat((pairSentReprTensor, spair), dim=0)
 
-        pairSentReprTensor.to(args.device)
-        cattention.to(args.device)
-        all_pairs.append(cattention.forward(pairSentReprTensor))
-    return all_pairs
+    # pairSentReprTensor.to(args.device)
+    # cattention.to(args.device)
+    # print("device: ", args.device)
+    sentReprTensor = cattention.forward(pairSentReprTensor)
+    # print("Sent Rep: ", sentReprTensor)
+    return sentReprTensor
 
-def train(args, train_dataset, model, tokenizer):
+
+def train(args, model, tokenizer):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
+    
+    processor = PairProcessor()
+    output_mode = 'classification'
 
-    args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(
-        train_dataset, 
-        sampler=train_sampler, 
-        batch_size=args.train_batch_size
-        )
-
-    if args.max_steps > 0:
-        t_total = args.max_steps
-        args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
-    else:
-        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
-
-    # Prepare optimizer and schedule (linear warmup and decay)
+    label_list = processor.get_labels()
+    # examples  = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+    examples  =  processor.get_train_examples(args.data_dir)
+     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 
@@ -159,19 +217,15 @@ def train(args, train_dataset, model, tokenizer):
         lr=args.learning_rate, 
         eps=args.adam_epsilon
         )
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, 
-        num_warmup_steps=args.warmup_steps, 
-        num_training_steps=t_total
-        )
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from "
-            "https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(
-            model, optimizer, opt_level=args.fp16_opt_level)
+
+    # if args.fp16:
+    #     try:
+    #         from apex import amp
+    #     except ImportError:
+    #         raise ImportError("Please install apex from "
+    #         "https://www.github.com/nvidia/apex to use fp16 training.")
+    #     model, optimizer = amp.initialize(
+    #         model, optimizer, opt_level=args.fp16_opt_level)
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
@@ -186,102 +240,173 @@ def train(args, train_dataset, model, tokenizer):
             find_unused_parameters=True
             )
 
-    # Train!
-    logger.info("***** Running training *****")
-    logger.info("  Num examples = %d", len(train_dataset))
-    logger.info("  Num Epochs = %d", args.num_train_epochs)
-    logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                   args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    logger.info("  Total optimization steps = %d", t_total)
+    set_seed(args)
+    para_id = 0
+    start_idx = 0
+    s1_id = []
+    s2_id = []
+    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32)
+    loss = nn.BCELoss()
+    for i,example in enumerate(examples):
+        ids = example.guid.split(":")
+        print("ids: ", ids)
+        if i!=0 and ids[0]!=para_id:
+            features = convert_examples_to_features(examples[start_idx:i],
+                                tokenizer,
+                                label_list=label_list[start_idx:i],
+                                max_length=args.max_seq_length,
+                                output_mode=output_mode,
+                                pad_on_left=False,                 # pad on the left for xlnet
+                                pad_token=tokenizer.convert_tokens_to_ids(
+                                    [tokenizer.pad_token])[0],
+                                pad_token_segment_id=0,
+                                )
 
-    global_step = 0
-    tr_loss, logging_loss = 0.0, 0.0
-    model.zero_grad()
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
-    set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            model.train()
-            #total_params = sum(functools.reduce( lambda a, b: a*b, x.size()) for x in model.parameters())
-            #print(total_params)
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {'input_ids':      batch[0],
-                      'attention_mask': batch[1],
-                      'token_type_ids': batch[2]
-                    }
+            all_input_ids = torch.tensor(
+                [f.input_ids for f in features], dtype=torch.long)
+            all_attention_mask = torch.tensor(
+                [f.attention_mask for f in features], dtype=torch.long)
+            all_token_type_ids = torch.tensor(
+                [f.token_type_ids for f in features], dtype=torch.long)
+            all_labels = torch.tensor(
+                [f.label for f in features], dtype=torch.long)
+            print("s1 id: ", s1_id)
+            all_s1 = torch.tensor([int(s) for s in s1_id], dtype=torch.int32)
+            all_s2 = torch.tensor([int(s) for s in s2_id], dtype=torch.int32)
+    
+            dataset = TensorDataset(
+                all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_s1, all_s2)
 
-            outputs = model(**inputs)
-            hidden_state = outputs[0]
-            print(hidden_state.shape)
-            hidden_state.to(args.device)
-            
-            sentTokenRange = getSent1TokenRange(inputs)
-            pairwiseSentenceRepresentation = attendToTokenEmbeddings(args, hidden_state, sentTokenRange)
-            allpairsSentenceRepresentation = attendToSentencePairs(args, pairwiseSentenceRepresentation)
-            
-            print(allpairsSentenceRepresentation)
-            # this goes into the paragraph encoder
-
-            # what do we send to the final linear layer?
-
-            # loss is calculated after this
-            
-            # loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
-
-            if args.n_gpu > 1:
-                loss = loss.mean() # mean() to average on multi-gpu parallel training
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+            start_idx = i
+            train_dataloader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+            if args.max_steps > 0:
+                t_total = args.max_steps
+                args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
             else:
-                loss.backward()
+                t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+            
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer, 
+                num_warmup_steps=args.warmup_steps, 
+                num_training_steps=t_total
+                )
+            logger.info("***** Running training *****")
+            logger.info("  Num examples = %d", len(dataset))
+            logger.info("  Num Epochs = %d", args.num_train_epochs)
+            # logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
+            # logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+            #             args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
+            # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+            logger.info("  Total optimization steps = %d", t_total)
+
+            global_step = 0
+            tr_loss, logging_loss = 0.0, 0.0
+            model.zero_grad()
+            train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
+            for _ in train_iterator:
+                n_sent = max(all_s2)
+                pairwiseSentenceRepresentation_1 = torch.zeros(n_sent + 1, n_sent + 1, 768)
+                pairwiseSentenceRepresentation_2 = torch.zeros(n_sent + 1, n_sent + 1, 768)
+
+                epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+                firstSentId = 1
+                for step, batch in enumerate(epoch_iterator):
+                    model.train()
+                    batch_1 = tuple(t.to(args.device) for t in batch)
+                    inputs = {'input_ids':      batch_1[0],
+                            'attention_mask': batch_1[1],
+                            'token_type_ids': batch_1[2]
+                            }
+                    labels = (batch_1[3]).to(torch.float32)
+                    s1 = batch_1[4]
+                    s2 = batch_1[5]
+                    outputs = model(**inputs)
+                    hidden_state = outputs[0]
+                    hidden_state.to(args.device)
+                    
+                    for i in range(hidden_state.shape[0]):
+                        sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
+                        res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
+                        pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
+                        pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
+                
+                allpairsSentenceRepresentation = torch.zeros(n_sent, 768)
+                for sent in range(n_sent):
+                    #get all 2n - 2 representations
+                    allReps = []
+                    for ri in range(n_sent):
+                        for ci in range(n_sent):
+                            if ri == sent or ci == sent:
+                                if pairwiseSentenceRepresentation_1[ri][ci] is not None:
+                                    allReps.append(pairwiseSentenceRepresentation_1[ri][ci])
+                                if pairwiseSentenceRepresentation_2[ri][ci] is not None:
+                                    allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
+                    
+                    allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
+                print("No of sentences: ", n_sent)
+                print("Sentence ids: ", s1)
+                print("Shape :", allpairsSentenceRepresentation.shape)
+            
+                allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
+                op = paragraphEncoder(allpairsSentenceRepresentation)
+                print("op.shape: ", op.shape)
+
+                for i in range(len(s1)):
+                    sent1_id, sent2_id = s1[i], s2[i]
+                    label = labels[i]
+            
+                    # print("OP: ", op[0][sent1_id].shape)
+                    x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
+                    output = lc(x)
+                    output[0].to(args.device)
+                    print("label : ", label.is_cuda)
+                    print("o/p: ",output.is_cuda)
+                    print("output: ",output[0])
+                    print("label: ",label)
+                    
+                    loss(output[0].reshape(1,-1), label.reshape(1,-1))
+                    loss.backward()
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-            tr_loss += loss.item()
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                optimizer.step()
-                scheduler.step()  # Update learning rate schedule
-                model.zero_grad()
-                global_step += 1
+                tr_loss += loss.item()
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    scheduler.step()  # Update learning rate schedule
+                    model.zero_grad()
+                    global_step += 1
+            
+            s1_id = []
+            s2_id = []
+        para_id = ids[0]
+        s1_id.append(ids[1])
+        s2_id.append(ids[2])
 
-                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    # Log metrics
-                    if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
-                        for key, value in results.items():
-                            tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-                    tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
-                    print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
-                    logging_loss = tr_loss
+    if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+        # Log metrics
+        if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+            results = evaluate(args, model, tokenizer)
+            for key, value in results.items():
+                tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+        tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+        tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+        print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
+        logging_loss = tr_loss
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    # Save model checkpoint
-                    output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
-                    if not os.path.exists(output_dir):
-                        os.makedirs(output_dir)
-                    model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
-                    model_to_save.save_pretrained(output_dir)
-                    torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-                    logger.info("Saving model checkpoint to %s", output_dir)
-
-            if args.max_steps > 0 and global_step > args.max_steps:
-                epoch_iterator.close()
-                break
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
+    if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+        # Save model checkpoint
+        output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+        model_to_save.save_pretrained(output_dir)
+        torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+        logger.info("Saving model checkpoint to %s", output_dir)
 
     if args.local_rank in [-1, 0]:
         tb_writer.close()
 
+            
     return global_step, tr_loss / global_step
 
 class MyTestDataset(Dataset):
@@ -504,71 +629,6 @@ def evaluate(args, model, tokenizer, prefix=""):
     return results
 
 
-def load_and_cache_examples(args, tokenizer, evaluate=False):
-    if args.local_rank not in [-1, 0] and not evaluate:
-        torch.distributed.barrier()  
-
-    processor = PairProcessor()
-    output_mode = 'classification'
-    
-    cached_features_file = os.path.join(
-        args.data_dir, 'cached_{}_{}_{}_{}'.format(
-        'dev' if evaluate else 'train',
-        'bert',
-        str(args.max_seq_length),
-        'pair_order'))
-
-    if os.path.exists(cached_features_file):
-        logger.info(
-            "Loading features from cached file %s", cached_features_file)
-        features = torch.load(cached_features_file)
-    else:
-        logger.info(
-            "Creating features from dataset file at %s", args.data_dir)
-        label_list = processor.get_labels()
-        examples  = processor.get_dev_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
-        para_id = []
-        s1_id = []
-        s2_id = []
-        for example in examples:
-            ids = example.guid.split(":")
-            para_id.append(ids[0])
-            s1_id.append(ids[1])
-            s2_id.append(ids[2])
-        
-        features = convert_examples_to_features(examples,
-                                    tokenizer,
-                                    label_list=label_list,
-                                    max_length=args.max_seq_length,
-                                    output_mode=output_mode,
-                                    pad_on_left=False,                 # pad on the left for xlnet
-                                    pad_token=tokenizer.convert_tokens_to_ids(
-                                        [tokenizer.pad_token])[0],
-                                    pad_token_segment_id=0,
-                                    )
-        if args.local_rank in [-1, 0]:
-            logger.info(
-                "Saving features into cached file %s", cached_features_file)
-            torch.save(features, cached_features_file)
-        
-    if args.local_rank == 0 and not evaluate:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-
-    # Convert to Tensors and build dataset
-    all_input_ids = torch.tensor(
-        [f.input_ids for f in features], dtype=torch.long)
-    all_attention_mask = torch.tensor(
-        [f.attention_mask for f in features], dtype=torch.long)
-    all_token_type_ids = torch.tensor(
-        [f.token_type_ids for f in features], dtype=torch.long)
-
-    all_labels = torch.tensor(
-        [f.label for f in features], dtype=torch.long)
-
-    dataset = TensorDataset(
-        all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
-    return dataset
-
 class PairProcessor(DataProcessor):
     """Pair Processor for the pair ordering task."""
 
@@ -758,10 +818,10 @@ def main():
 
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(
-                        args, tokenizer, evaluate=False)
+        # train_dataset = load_and_cache_examples(
+        #                 args, tokenizer, evaluate=False)
         global_step, tr_loss = train(
-                        args, train_dataset, model, tokenizer)
+                        args, model, tokenizer)
         logger.info(
             " global_step = %s, average loss = %s", global_step, tr_loss)
 
