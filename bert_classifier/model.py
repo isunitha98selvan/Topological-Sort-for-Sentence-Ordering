@@ -89,9 +89,10 @@ class AdditiveAttention(nn.Module):
       return result
 
 hidden_dim = 768
-cattention = AdditiveAttention(hidden_dim)
-a = AdditiveAttention(hidden_dim)
-lc = LinearClassifier(hidden_dim)
+cattention = AdditiveAttention(hidden_dim).cuda()
+a = AdditiveAttention(hidden_dim).cuda()
+lc = LinearClassifier(hidden_dim).cuda()
+
 
 class EncoderBlock(nn.Module):
   def __init__(self, hidden_dim, num_heads, dim_feedforward):
@@ -147,7 +148,7 @@ def getSent1TokenRange(inputId):
 
 def attendToTokenEmbeddings(args, tokenEmbeddingAfterBertLayer, sentTokenRange):
     sentenceRepresentation = []
-
+    a.to(args.device)
     tokenRanges1 = sentTokenRange[0]
     tokenRanges2 = sentTokenRange[1]
     s1Id = tokenRanges1[0]
@@ -156,14 +157,14 @@ def attendToTokenEmbeddings(args, tokenEmbeddingAfterBertLayer, sentTokenRange):
     e2Id = tokenRanges2[1]
 
     firstSentenceTokenRep = tokenEmbeddingAfterBertLayer[s1Id : e1Id]
-    firstSentenceTokenRep.to(args.device)
-    a.to(args.device)
+    # firstSentenceTokenRep.to(args.device)
+    
     sentence_rep_s1 = a.forward(firstSentenceTokenRep)
     sentenceRepresentation.append(sentence_rep_s1)
 
     secondSentenceTokenRep = tokenEmbeddingAfterBertLayer[s2Id : e2Id]
-    secondSentenceTokenRep.to(args.device)
-    a.to(args.device)
+    # secondSentenceTokenRep.to(args.device)
+    # a.to(args.device)
     sentence_rep_s2 = a.forward(secondSentenceTokenRep)
     sentenceRepresentation.append(sentence_rep_s2)
 
@@ -175,7 +176,7 @@ def attendToSentencePairs(args, pairwiseSentenceRepresentation):
 
     if len(pairwiseSentenceRepresentation) > 0:
         pairwiseSentenceRepresentation[0] = pairwiseSentenceRepresentation[0].reshape(1,-1)
-        pairSentReprTensor = pairwiseSentenceRepresentation[0]
+        pairSentReprTensor = pairwiseSentenceRepresentation[0].cuda()
         # pairwiseSentenceRepresentation[0].to(args.device)
         
     for i,spair in enumerate(pairwiseSentenceRepresentation):
@@ -232,19 +233,25 @@ def train(args, model, tokenizer):
             )
 
     set_seed(args)
-    para_id = 0
-    start_idx = 0
-    s1_id = []
-    s2_id = []
-    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32)
+    
+    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).cuda()
     loss = nn.BCELoss()
-    for epoch in range(3):
+    acc_loss = 0.0
+    global_step = 0
+    for epoch in range(1):
+        tr_loss = 0.0
+        print("Starting epoch: ", epoch)
+        para_id = 0
+        start_idx = 0
+        s1_id = []
+        s2_id = []
         for i,example in enumerate(examples):
+            # print("Batch: ", i)
             ids = example.guid.split(":")
             if i!=0 and ids[0]!=para_id:
                 features = convert_examples_to_features(examples[start_idx:i],
                                     tokenizer,
-                                    label_list=label_list[start_idx:i],
+                                    label_list=label_list,
                                     max_length=args.max_seq_length,
                                     output_mode=output_mode,
                                     pad_on_left=False,                 # pad on the left for xlnet
@@ -263,7 +270,7 @@ def train(args, model, tokenizer):
                     [f.label for f in features], dtype=torch.long)
                 all_s1 = torch.tensor([int(s) for s in s1_id], dtype=torch.int32)
                 all_s2 = torch.tensor([int(s) for s in s2_id], dtype=torch.int32)
-        
+
                 dataset = TensorDataset(
                     all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_s1, all_s2)
 
@@ -289,37 +296,34 @@ def train(args, model, tokenizer):
                 # logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
                 logger.info("  Total optimization steps = %d", t_total)
 
-                global_step = 0
-                tr_loss, logging_loss = 0.0, 0.0
-                train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
-                for _ in train_iterator:
-                    n_sent = max(all_s2) + 1
-                    pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768)
-                    pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768)
+                n_sent = max(all_s2) + 1
+                pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).cuda()
+                pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).cuda()
 
-                    epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-                    firstSentId = 1
-                    for step, batch in enumerate(epoch_iterator):
-                        model.train()
-                        batch_1 = tuple(t.to(args.device) for t in batch)
-                        inputs = {'input_ids':      batch_1[0],
-                                'attention_mask': batch_1[1],
-                                'token_type_ids': batch_1[2]
-                                }
-                        labels = (batch_1[3]).to(torch.float32)
-                        s1 = batch_1[4]
-                        s2 = batch_1[5]
-                        outputs = model(**inputs)
-                        hidden_state = outputs[0]
-                        hidden_state.to(args.device)
-                        for i in range(hidden_state.shape[0]):
-                            sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
-                            res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
-                            pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
-                            pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
-                    
-                    allpairsSentenceRepresentation = torch.zeros(n_sent, 768)
-                    allpairsSentenceRepresentation.to(args.device)
+                train_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+                for step, batch in enumerate(train_iterator):
+                    model.train()
+                    batch_1 = tuple(t.to(args.device) for t in batch)
+
+                    inputs = {'input_ids':      batch_1[0],
+                            'attention_mask': batch_1[1],
+                            'token_type_ids': batch_1[2]
+                            }
+                    labels = (batch_1[3]).to(torch.float32)
+                    s1 = batch_1[4]
+                    s2 = batch_1[5]
+                    outputs = model(**inputs)
+                    hidden_state = outputs[0]
+                    model.to(args.device)
+                    hidden_state.to(args.device)
+                    for i in range(hidden_state.shape[0]):
+                        sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
+                        res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
+                        pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
+                        pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
+                
+                    allpairsSentenceRepresentation = torch.zeros(n_sent, 768).cuda()
+              
                     for sent in range(n_sent):
                         #get all 2n - 2 representations
                         allReps = []
@@ -330,34 +334,31 @@ def train(args, model, tokenizer):
                                         allReps.append(pairwiseSentenceRepresentation_1[ri][ci])
                                     if pairwiseSentenceRepresentation_2[ri][ci] is not None:
                                         allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
-                        
-                        allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
-                
-                    allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
-                    op = paragraphEncoder(allpairsSentenceRepresentation)
+                    
 
-                    for i in range(len(s1)):
-                        sent1_id, sent2_id = s1[i], s2[i]
-                        label = labels[i]
-                
-                        # print("OP: ", op[0][sent1_id].shape)
-                        x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
-                        output = lc(x)
-                        output[0].to(args.device)
-                        # print("label : ", label.is_cuda)
-                        # print("o/p: ",output.is_cuda)
-                        # print("output: ",output[0])
-                        # print("label: ",label)
-                        
-                        tr_loss=loss(output[0].reshape(1,-1), label.reshape(1,-1))
-                        print("Loss", tr_loss)
-                        model.zero_grad()
-                        tr_loss.backward(retain_graph=True)
-                        optimizer.step()
-                        scheduler.step()
-                        global_step += 1
+                    allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
+            
+                allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
+                op = paragraphEncoder(allpairsSentenceRepresentation)
 
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                for i in range(len(s1)):
+                    sent1_id, sent2_id = s1[i], s2[i]
+                    label = labels[i]
+            
+                    x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
+                    output = lc(x)
+                    output[0].to(args.device)
+                    tr_loss=loss(output[0].reshape(1,-1), label.reshape(1,-1))
+                    print("Loss", tr_loss)
+                    model.zero_grad()
+                    tr_loss.backward(retain_graph=True)
+                    optimizer.step()
+                    scheduler.step()
+                    global_step += 1
+                    acc_loss+=tr_loss
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 
                 s1_id = []
                 s2_id = []
@@ -365,31 +366,31 @@ def train(args, model, tokenizer):
             s1_id.append(ids[1])
             s2_id.append(ids[2])
 
-        if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-            # Log metrics
-            if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                results = evaluate(args, model, tokenizer)
-                for key, value in results.items():
-                    tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
-            tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-            tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
-            print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
-            logging_loss = tr_loss
+        # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+        # Log metrics
+        # if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
+        results = evaluate(args, model, tokenizer)
+        
+        # for key, value in results.items():
+        #     tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
+        tb_writer.add_scalar('loss', results)
+        # tb_writer.add_scalar('loss', (tr_loss - logging_loss)/args.logging_steps, global_step)
+        # print('loss: ' + str((tr_loss - logging_loss)/args.logging_steps) + ' step: ' + str(global_step))
+        # logging_loss = tr_loss
 
-        if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+        # if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
             # Save model checkpoint
-            output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-            model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
-            model_to_save.save_pretrained(output_dir)
-            torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-            logger.info("Saving model checkpoint to %s", output_dir)
+        output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        model_to_save = model.module if hasattr(model, 'module') else model  # Take care of distributed/parallel training
+        model_to_save.save_pretrained(output_dir)
+        torch.save(args, os.path.join(output_dir, 'training_args.bin'))
+        logger.info("Saving model checkpoint to %s", output_dir)
 
     if args.local_rank in [-1, 0]:
         tb_writer.close()
 
-            
     return global_step, tr_loss / global_step
 
 class MyTestDataset(Dataset):
@@ -552,64 +553,170 @@ def evaluate_test(args, model, tokenizer, prefix=""):
 def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     
-    eval_outputs_dirs = (args.output_dir,)
+    eval_outputs_dirs = (args.output_dir)
 
     results = {}
+    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).cuda()
     for eval_output_dir in eval_outputs_dirs:
-        eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
+        # eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
 
         if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
             os.makedirs(eval_output_dir)
 
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
         # Note that DistributedSampler samples randomly
-        eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
-        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+        # eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+        para_id = 0
+        start_idx = 0
+        s1_id = []
+        s2_id = []
+        # output_file = os.path.join(eval_output_dir, "results.txt")
+        # print("output file: ", output_file)
+        f = open("results.txt", "w")
 
-        # Eval!
-        logger.info("***** Running evaluation {} *****".format(prefix))
-        logger.info("  Num examples = %d", len(eval_dataset))
-        logger.info("  Batch size = %d", args.eval_batch_size)
-        eval_loss = 0.0
-        nb_eval_steps = 0
-        preds = None
-        out_label_ids = None
-        for batch in tqdm(eval_dataloader, desc="Evaluating"):
-            model.eval()
-            batch = tuple(t.to(args.device) for t in batch)
+        processor = PairProcessor()
+        output_mode = 'classification'
+        label_list = processor.get_labels()
+        examples = processor.get_test_examples(args.data_dir)
+        loss = nn.BCELoss()
+        global_step = 0
+        tr_loss = 0
+        preds = []
+        all_labels = []
+        out_label_ids = []
+        for i, example in enumerate(examples[0]):
+            # print("Inner: ")
+            # break
+            ids = example.guid.split(":")
+            if i!=0 and ids[0]!=para_id:
+                features = convert_examples_to_features(examples[0][start_idx:i],
+                                    tokenizer,
+                                    label_list=label_list,
+                                    max_length=args.max_seq_length,
+                                    output_mode=output_mode,
+                                    pad_on_left=False,                 # pad on the left for xlnet
+                                    pad_token=tokenizer.convert_tokens_to_ids(
+                                        [tokenizer.pad_token])[0],
+                                    pad_token_segment_id=0,
+                                    )
 
-            with torch.no_grad():
-                inputs = {'input_ids':      batch[0],
-                          'attention_mask': batch[1],
-                          'token_type_ids': batch[2],
-                          'labels':         batch[3]
-                        }
-                outputs = model(**inputs)
-                tmp_eval_loss, logits = outputs[:2]
+                all_input_ids = torch.tensor(
+                    [f.input_ids for f in features], dtype=torch.long)
+                all_attention_mask = torch.tensor(
+                    [f.attention_mask for f in features], dtype=torch.long)
+                all_token_type_ids = torch.tensor(
+                    [f.token_type_ids for f in features], dtype=torch.long)
+                all_labels = torch.tensor(
+                    [f.label for f in features], dtype=torch.long)
+                all_s1 = torch.tensor([int(s) for s in s1_id], dtype=torch.int32)
+                all_s2 = torch.tensor([int(s) for s in s2_id], dtype=torch.int32)
+                eval_dataset = TensorDataset(
+                    all_input_ids, all_attention_mask, all_token_type_ids, all_labels, all_s1, all_s2)
 
-                eval_loss += tmp_eval_loss.mean().item()
-            nb_eval_steps += 1
-            if preds is None:
-                preds = logits.detach().cpu().numpy()
-                out_label_ids = inputs['labels'].detach().cpu().numpy()
-            else:
-                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-                out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
+                start_idx = i
 
-        eval_loss = eval_loss / nb_eval_steps
-        preds = np.argmax(preds, axis=1)
+                eval_dataloader = DataLoader(eval_dataset, batch_size=len(eval_dataset))
 
-        result = compute_metrics("mnli", preds, out_label_ids)
-        results.update(result)
+                # Eval!
+                logger.info("***** Running evaluation {} *****".format(prefix))
+                logger.info("  Num examples = %d", len(eval_dataset))
+                logger.info("  Batch size = %d", args.eval_batch_size)
+                n_sent = max(max(all_s1), max(all_s2))+ 1
+                
+                for batch in tqdm(eval_dataloader, desc="Evaluating"):
+                    model.eval()
+                    batch = tuple(t.to(args.device) for t in batch)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        with open(output_eval_file, "w") as writer:
-            logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+                    with torch.no_grad():
+                        inputs = {'input_ids':      batch[0],
+                                'attention_mask': batch[1],
+                                'token_type_ids': batch[2],
+                                }
+                        outputs = model(**inputs)
+                        hidden_state = outputs[0]
+                        labels = (batch[3]).to(torch.float32)
+                        s1 = batch[4]
+                        s2 = batch[5]
+                        
+                        pairwiseSentenceRepresentation_1 = torch.zeros(n_sent, n_sent, 768).cuda()
+                        pairwiseSentenceRepresentation_2 = torch.zeros(n_sent, n_sent, 768).cuda()
 
-    return results
+                        for i in range(hidden_state.shape[0]):
+                            sentTokenRange = getSent1TokenRange(inputs["input_ids"][i])
+                            res = attendToTokenEmbeddings(args, hidden_state[i], sentTokenRange)
+                            pairwiseSentenceRepresentation_1[s1[i]][s2[i]] = res[0]
+                            pairwiseSentenceRepresentation_2[s1[i]][s2[i]] = res[1]
+                    
+                    allpairsSentenceRepresentation = torch.zeros(n_sent, 768).cuda()
+              
+                    for sent in range(n_sent):
+                        #get all 2n - 2 representations
+                        allReps = []
+                        for ri in range(n_sent):
+                            for ci in range(n_sent):
+                                if ri == sent or ci == sent:
+                                    if pairwiseSentenceRepresentation_1[ri][ci] is not None:
+                                        allReps.append(pairwiseSentenceRepresentation_1[ri][ci])
+                                    if pairwiseSentenceRepresentation_2[ri][ci] is not None:
+                                        allReps.append(pairwiseSentenceRepresentation_2[ri][ci])
+                    
+
+                    allpairsSentenceRepresentation[sent] = attendToSentencePairs(args, allReps)
+            
+                    allpairsSentenceRepresentation = allpairsSentenceRepresentation.unsqueeze(0)
+                    op = paragraphEncoder(allpairsSentenceRepresentation)
+                    for i in range(len(s1)):
+                        sent1_id, sent2_id = s1[i], s2[i]
+                        label = labels[i]
+                
+                        x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
+                        output = lc(x)
+                        output[0].to(args.device)
+                        tr_loss+=loss(output[0].reshape(1,-1), label.reshape(1,-1))
+                        # preds.append(output[0].item())
+                        if output[0]>0.5:
+                            preds.append(1.0)
+                        else:
+                            preds.append(0.0)
+
+                        out_label_ids.append(label.item())
+                        global_step += 1
+                        
+                        f.write(str(para_id) + " " + str(sent1_id) + " " + str(sent2_id) + " " + str(output[0]) + " " + str(label))
+                s1_id = []
+                s2_id = []
+            para_id = ids[0]
+            s1_id.append(ids[1])
+            s2_id.append(ids[2])
+
+            
+                # if preds is None:
+                #     preds = logits.detach().cpu().numpy()
+                #     out_label_ids = inputs['labels'].detach().cpu().numpy()
+                # else:
+                #     preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
+                #     out_label_ids = np.append(out_label_ids, inputs['labels'].detach().cpu().numpy(), axis=0)
+
+        eval_loss = tr_loss / global_step
+        print("Eval loss: ", eval_loss)
+    return eval_loss
+        # preds = np.argmax(preds, axis=1)
+        # print(preds)
+        # print(out_label_ids)
+        # print("Printing dtype:")
+        # print(type(preds[0]))
+        # print(type(out_label_ids[0]))
+    #     result = compute_metrics("mnli", preds, out_label_ids)
+    #     results.update(result)
+
+    #     output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+    #     with open(output_eval_file, "w") as writer:
+    #         logger.info("***** Eval results {} *****".format(prefix))
+    #         for key in sorted(result.keys()):
+    #             logger.info("  %s = %s", key, str(result[key]))
+    #             writer.write("%s = %s\n" % (key, str(result[key])))
+
+    # return results
 
 
 class PairProcessor(DataProcessor):

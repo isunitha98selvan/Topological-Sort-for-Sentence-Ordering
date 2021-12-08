@@ -101,11 +101,9 @@ class DataHandler:
                         x += 1
                         r = random.random()
                         if r >= 0.5:
-                            tmp.append([str(file)+'-'+str(y)+'-'+str(len(lines)), \
-                                                sent1, sent2, 1, i, j])
+                            tmp.append([str(file)+':'+str(i)+':'+str(j)+':'+str(y)+'-'+str(len(lines)), sent1, sent2, 1, i, j])
                         else:
-                            tmp.append([str(file)+'-'+str(y)+'-'+str(len(lines)), \
-                                                sent2, sent1, 0, j, i])
+                            tmp.append([str(file)+':'+str(j)+':'+str(i)+':'+str(y)+'-'+str(len(lines)), sent1, sent2, 0, j, i])
 
                 for row in tmp:
                     #adding no of pairs of sentences in the end
