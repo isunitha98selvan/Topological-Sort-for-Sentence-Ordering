@@ -66,12 +66,14 @@ class LinearClassifier(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
         
-        self.fcc = nn.Linear(hidden_dim*2, 1)
+        self.fcc = nn.Linear(hidden_dim*2, 256)
+        self.fcc_2 = nn.Linear(256,1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, inp):
         l1 = self.fcc(inp)
-        return self.sigmoid(l1)
+        l2 = self.fcc_2(l1)
+        return self.sigmoid(l2)
 
 class AdditiveAttention(nn.Module):
     
@@ -365,10 +367,16 @@ def train(args, model, tokenizer):
             
                     x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
                     with autocast():
-                        output = lc(x)
-                        allpreds[i] = output[0]
+                        res = lc(x)
+                        # output_0, output_1 = res[0][0], res[0][1]
+                        # pred = torch.argmax(res[0])
+                        if res[0]>0.5:
+                            pred = 1
+                        else:
+                            pred = 0
+                        allpreds[i] = res[0][0]
                         alllabel[i] = label
-
+                
                 # tr_loss=loss(output[0].reshape(1,-1), label.reshape(1,-1))
                 with autocast():
                     tr_loss = loss(allpreds, alllabel)
@@ -415,7 +423,7 @@ def train(args, model, tokenizer):
         # if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
         # Log metrics
         # if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-    results = evaluate(args, model, tokenizer, a , cattention, lc)
+    results = evaluate(args, model, tokenizer, a , cattention, lc, paragraphEncoder)
     
     # for key, value in results.items():
     #     tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
@@ -590,13 +598,13 @@ def evaluate_test(args, model, tokenizer, prefix=""):
 
     return results
 
-def evaluate(args, model, tokenizer, a, cattention, lc, prefix=""):
+def evaluate(args, model, tokenizer, a, cattention, lc, paragraphEncoder, prefix="", ):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     
     eval_outputs_dirs = (args.output_dir)
 
     results = {}
-    paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).to(device=args.device)
+    # paragraphEncoder = ParagraphEncoder(12, 768, 6, 32).to(device=args.device)
     for eval_output_dir in eval_outputs_dirs:
         # eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
 
@@ -708,15 +716,16 @@ def evaluate(args, model, tokenizer, a, cattention, lc, prefix=""):
                 
                         x = torch.cat((op[0][sent1_id].reshape(1,-1), op[0][sent2_id].reshape(1,-1)), dim = -1)
                         output = lc(x)
+                        if output[0]>0.5:
+                            pred = 1.0
+                        else:
+                            pred = 0.0
+                        # pred = np.argmax(output_0, output_1)
                         # output[0].to(args.device)
                         tr_loss+=loss(output[0].reshape(1,-1), label.reshape(1,-1))
                         # preds.append(output[0].item())
                         res = 0.0
-                        if output[0]>0.5:
-                            res = 1.0  
-                        else:
-                            res = 0.0
-                        preds.append(res)
+                        preds.append(pred)
 
                         out_label_ids.append(label.item())
                         global_step += 1
