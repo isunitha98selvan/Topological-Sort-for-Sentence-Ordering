@@ -1,5 +1,8 @@
 # Topological Sort for Sentence Ordering
-Code accompanying the paper: [Topological Sort for Sentence Ordering](https://arxiv.org/pdf/2005.00432.pdf)
+This repository contains the code for the 11-711 Project: Topological Sort for Sentence Ordering. 
+We model our work on top of the existing architecture and problem formulation in this Paper : [Topological Sort for Sentence Ordering](https://arxiv.org/pdf/2005.00432.pdf)
+
+We modify the B-TSort Architecture by adding Multi-level attention to capture the context in the sentence representations. We then pass it through a binary classifier using the same sentence classification objective as in the paper mentioned above. We also experiment with ALBERT as it has a sentence ordering objective. 
 
 ## Pre-requisites
 - Python 3.6
@@ -77,16 +80,3 @@ http://tts.speech.cs.cmu.edu/sentence_order/sind_lstm.pt
 
 ## Baselines
 For the code of the model denoted as AON in the paper, please email the authors of [Deep Attentive Sentence Ordering Network](https://www.aclweb.org/anthology/D18-1465/).
-
-## Contributors
-If you use this code please cite the following:
-
-Prabhumoye, Shrimai, Ruslan Salakhutdinov, and Alan W. Black. "Topological Sort for Sentence Ordering." In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics.
-
-    @inproceedings{topSort2020,
-      title={Topological Sort for Sentence Ordering},
-      author={Prabhumoye, Shrimai and Salakhutdinov, Ruslan and Black, Alan W},
-      booktitle={Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics},
-      publisher={Association for Computational Linguistics},
-      year={2020},
-      }
