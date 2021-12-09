@@ -38,7 +38,7 @@ python model.py --data_dir ../nips_data/ --output_dir ../trained_models/nips_ber
 ```
 
 ### LSTM-based representation (L-TSort Classifier)
-The code base for this classifier is in `lstm_classifier` folder.
+The code base for this classifier is in `lstm_classifier` folder. This is part of the previous code base. We have not made any changes here.
 
 - Create a `data` dir in the `lstm_classifier` folder and run the following preprocess command:
 ```
@@ -60,22 +60,6 @@ Run the topological sort script on the outputs of the B-TSort and L-TSort models
 
 ```
 python topological_sort.py --file_path nips_data/test_results.tsv
-```
-
-## Trained Models
-
-- Download the trained B-TSort models for each of the four datasets from the below links:
-```bash
-http://tts.speech.cs.cmu.edu/sentence_order/nips_bert.tar
-http://tts.speech.cs.cmu.edu/sentence_order/aan_bert.tar
-http://tts.speech.cs.cmu.edu/sentence_order/nsf_bert.tar
-http://tts.speech.cs.cmu.edu/sentence_order/sind_bert.tar
-```
-
-- Download the trained L-TSort models for NIPS and SIND datasets from the below links:
-```bash
-http://tts.speech.cs.cmu.edu/sentence_order/nips_lstm.pt
-http://tts.speech.cs.cmu.edu/sentence_order/sind_lstm.pt
 ```
 
 ## Baselines
